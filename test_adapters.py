@@ -248,6 +248,35 @@ def probe_company(c: dict, samples: int = 4) -> bool:
 # Offline self-test (no network)
 # --------------------------------------------------------------------------- #
 
+def f_string_311_issues(path: str) -> list:
+    """f-string constructs that are SyntaxErrors before Python 3.12 (Raspberry Pi OS ships 3.11):
+    a backslash or a reused quote character inside a {replacement field}. Needs Python 3.12+ to scan."""
+    import io
+    import tokenize
+    if not hasattr(tokenize, "FSTRING_START"):
+        return []
+    src = open(path, encoding="utf-8").read()
+    frames, issues = [], []
+    for t in tokenize.generate_tokens(io.StringIO(src).readline):
+        if t.type == tokenize.FSTRING_START:
+            q = t.string.lstrip("rRbBfFuU")
+            frames.append({"q": q[:3] if q[:3] in ('"""', "\'\'\'") else q[:1], "depth": 0})
+        elif t.type == tokenize.FSTRING_END:
+            frames.pop()
+        elif frames:
+            f = frames[-1]
+            if t.type == tokenize.OP and t.string == "{":
+                f["depth"] += 1
+            elif t.type == tokenize.OP and t.string == "}":
+                f["depth"] -= 1
+            elif f["depth"] > 0 and t.type != tokenize.FSTRING_MIDDLE:
+                if "\\" in t.string:
+                    issues.append((t.start[0], "backslash inside f-string expression"))
+                elif t.type == tokenize.STRING and t.string.lstrip("rRbBfFuU").startswith(f["q"]):
+                    issues.append((t.start[0], "same quote reused inside f-string expression"))
+    return issues
+
+
 def selftest() -> bool:
     failures = []
 
@@ -856,6 +885,103 @@ def selftest() -> bool:
     finally:
         A.http_json, A.time.sleep = saved, saved_sleep
         A._wd_session, A._wd_session_post, A._wd_session_get = saved_sess, saved_spost, saved_sget
+
+    # --- round 8: fewer requests (early-stop paging), HTML-aware errors, Python 3.11 compatibility ---
+    import http.server, os, threading
+    os.environ["no_proxy"] = os.environ["NO_PROXY"] = "127.0.0.1"
+
+    class HtmlHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            page = b"<!DOCTYPE html><html><head><title>Access Denied</title><style>body{}</style></head></html>"
+            self.send_response(520 if self.path.startswith("/e520") else 200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(page)))
+            self.end_headers()
+            self.wfile.write(page)
+
+        def log_message(self, *a):
+            pass
+
+    srv2 = http.server.HTTPServer(("127.0.0.1", 0), HtmlHandler)
+    threading.Thread(target=srv2.serve_forever, daemon=True).start()
+    try:
+        for path, want in (("/e520", ("HTTP 520", "(HTML error page)")),
+                           ("/ok200", ("response was not JSON", "an HTML page", "Access Denied"))):
+            try:
+                A.http_json("GET", f"http://127.0.0.1:{srv2.server_port}{path}")
+                expect(f"html reply {path} raises", False, True)
+            except A.AdapterError as e:
+                expect(f"html reply {path} explained", all(w_ in str(e) for w_ in want), True)
+    finally:
+        srv2.shutdown()
+
+    saved_sleep = A.time.sleep
+    A.time.sleep = lambda s_: None
+    wd_reqs = []
+
+    def fake_pages(method, url, body=None, extra=None, timeout=30):
+        off = (body or {}).get("offset", 0)
+        wd_reqs.append(off)
+        posts = [{"title": f"Engineer {i}", "externalPath": f"/job/a/E_{i}", "bulletFields": [f"R{i}"],
+                  "locationsText": "Austin, TX", "postedOn": "Posted Today"} for i in range(off, min(off + 20, 100))]
+        return 200, {"total": 100, "jobPostings": posts, "facets": []}
+
+    ora_reqs = []
+
+    def fake_ora_pages(method, url, body=None, extra=None, timeout=30):
+        off = int(re.search(r"offset=(\d+)", url).group(1))
+        ora_reqs.append(off)
+        reqs = [{"Id": i + 1, "Title": f"Engineer {i}", "PostedDate": "2026-11-05",
+                 "PrimaryLocation": "Dallas, TX, United States"} for i in range(off, min(off + 25, 100))]
+        return 200, {"items": [{"TotalJobsCount": 100, "requisitionList": reqs}]}
+
+    class FW2:
+        pages_seen = []
+
+        @staticmethod
+        def fetch_jobs(q, debug, max_pages, filters):
+            FW2.pages_seen.append(max_pages)
+            return [], 0
+
+    saved_watcher = A._watcher
+    try:
+        A.http_json = fake_pages
+        wd_cfg2 = {"name": "E", "provider": "workday", "host": "early.wd1.myworkdayjobs.com", "site": "S"}
+        known_first_page = {f"R{i}" for i in range(20)}
+        wd_reqs.clear()
+        A.workday_list("early.wd1.myworkdayjobs.com", "S", "", 8, known=known_first_page)
+        expect("workday stops after a page of only known jobs", wd_reqs, [0])
+        wd_reqs.clear()
+        A.workday_list("early.wd1.myworkdayjobs.com", "S", "", 8, known=set())
+        expect("empty known set pages through everything", wd_reqs, [0, 20, 40, 60, 80, 100])
+        wd_reqs.clear()
+        A.fetch_company_jobs(wd_cfg2)
+        expect("first poll: facets + 3 seed pages", len(wd_reqs), 4)
+        wd_reqs.clear()
+        A.fetch_company_jobs(wd_cfg2, None, known_first_page)
+        expect("later poll: facets + 1 page", len(wd_reqs), 2)
+
+        A.http_json = fake_ora_pages
+        ora_cfg = {"name": "O", "provider": "oracle", "host": "o.oraclecloud.com", "site": "CX", "site_number": "CX_1"}
+        ora_reqs.clear()
+        A.fetch_company_jobs(ora_cfg, None, {str(i) for i in range(1, 26)})
+        expect("oracle stops after a page of only known jobs", ora_reqs, [0])
+        ora_reqs.clear()
+        A.fetch_company_jobs(ora_cfg)
+        expect("oracle first poll reads the seed pages", ora_reqs, [0, 25, 50])
+
+        A._watcher = lambda: FW2
+        A.fetch_company_jobs({"name": "RTX", "provider": "phenom"})
+        A.fetch_company_jobs({"name": "RTX", "provider": "phenom"}, None, {"1"})
+        expect("phenom pages: seed = 3 per level, steady = 2 per level", FW2.pages_seen, [3, 3, 2, 2])
+    finally:
+        A.http_json, A.time.sleep, A._watcher = saved, saved_sleep, saved_watcher
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    for fname in ("ats_adapters.py", "test_adapters.py", "job_alert_bot.py"):
+        fpath = os.path.join(here, fname)
+        if os.path.exists(fpath):
+            expect(f"{fname} avoids syntax that breaks on Python 3.11", f_string_311_issues(fpath), [])
 
     if failures:
         print("SELFTEST FAILED:\n  " + "\n  ".join(failures))

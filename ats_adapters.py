@@ -69,6 +69,27 @@ class AdapterError(Exception):
     pass
 
 
+def _clean_detail(text: str) -> str:
+    text = (text or "").strip().replace("\n", " ")
+    return "(HTML error page)" if text.lstrip().startswith("<") else text[:300]
+
+
+def _http_error_text(e, url: str, hint: str = "") -> str:
+    try:
+        detail = _clean_detail(e.read(300).decode("utf-8", "replace"))
+    except Exception:
+        detail = ""
+    return f"HTTP {e.code} from {url.split('?')[0]}{hint}" + (f": {detail}" if detail else "")
+
+
+def _not_json(text: str) -> AdapterError:
+    kind = "an HTML page" if "<" in (text or "")[:300] else "text"
+    m = re.search(r"<title>(.*?)</title>", text or "", re.I | re.S)
+    t = re.sub(r"\s+", " ", m.group(1)).strip()[:80] if m else ""
+    title = f", title {t!r}" if t else ""
+    return AdapterError(f"response was not JSON ({kind}{title} - probably rate limiting or a bot check)")
+
+
 def http_json(method: str, url: str, body=None, extra=None, timeout: int = 30):
     headers = {"User-Agent": UA, "Accept": "application/json"}
     if body is not None:
@@ -78,18 +99,17 @@ def http_json(method: str, url: str, body=None, extra=None, timeout: int = 30):
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, json.loads(r.read().decode("utf-8", "replace"))
+            text = r.read().decode("utf-8", "replace")
+            status = r.status
+        try:
+            return status, json.loads(text)
+        except json.JSONDecodeError:
+            raise _not_json(text)
     except urllib.error.HTTPError as e:
         hint = " (possibly bot protection - try later or from another network)" if e.code in (403, 429) else ""
-        try:
-            detail = e.read(300).decode("utf-8", "replace").strip().replace("\n", " ")
-        except Exception:
-            detail = ""
-        raise AdapterError(f"HTTP {e.code} from {url.split('?')[0]}{hint}" + (f": {detail}" if detail else ""))
+        raise AdapterError(_http_error_text(e, url, hint))
     except urllib.error.URLError as e:
         raise AdapterError(f"network error: {e.reason}")
-    except json.JSONDecodeError:
-        raise AdapterError("response was not JSON (probably an HTML page or bot check)")
 
 
 def _finish(job: dict) -> dict:
@@ -137,17 +157,15 @@ _WD_SESSIONS: dict[str, tuple] = {}   # host -> (opener with cookies, csrf token
 def _open_json(opener, req, timeout: int, url: str):
     try:
         with opener.open(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8", "replace"))
-    except urllib.error.HTTPError as e:
+            text = r.read().decode("utf-8", "replace")
         try:
-            detail = e.read(300).decode("utf-8", "replace").strip().replace("\n", " ")
-        except Exception:
-            detail = ""
-        raise AdapterError(f"HTTP {e.code} from {url.split('?')[0]}" + (f": {detail}" if detail else ""))
+            return json.loads(text)
+        except json.JSONDecodeError:
+            raise _not_json(text)
+    except urllib.error.HTTPError as e:
+        raise AdapterError(_http_error_text(e, url))
     except urllib.error.URLError as e:
         raise AdapterError(f"network error: {e.reason}")
-    except json.JSONDecodeError:
-        raise AdapterError("response was not JSON (probably an HTML page or bot check)")
 
 
 def _wd_session(host: str, site: str):
@@ -237,7 +255,8 @@ def _wd_post(host: str, site: str, offset: int, page_size: int, search: str, app
 
 
 def workday_list(host: str, site: str, search: str = "", pages: int = 2,
-                 page_size: int = 20, company: str = "", applied: dict | None = None):
+                 page_size: int = 20, company: str = "", applied: dict | None = None,
+                 known: set | None = None):
     jobs, total, offset = [], None, 0
     for _ in range(pages):
         data, size = _wd_post(host, site, offset, page_size, search, applied)
@@ -246,10 +265,13 @@ def workday_list(host: str, site: str, search: str = "", pages: int = 2,
         if total is None:
             total = data.get("total")
         batch = data["jobPostings"]
-        jobs += [normalize_workday(x, host, site, company) for x in batch]
+        fresh = [normalize_workday(x, host, site, company) for x in batch]
+        jobs += fresh
         offset += len(batch)
         if len(batch) < size:
             break
+        if known and fresh and all(j["id"] in known for j in fresh):
+            break  # newest-first: a page of only known jobs means nothing newer is left
         time.sleep(0.5)
     return jobs, total
 
@@ -362,7 +384,7 @@ def _iso_date(s):
 
 
 def oracle_list(host: str, site: str, site_number: str, search: str = "", pages: int = 2,
-                page_size: int = 25, company: str = ""):
+                page_size: int = 25, company: str = "", known: set | None = None):
     base = f"https://{host}/hcmRestApi/resources/latest/recruitingCEJobRequisitions"
     facets = urllib.parse.quote("LOCATIONS;WORK_LOCATIONS;TITLES;CATEGORIES;POSTING_DATES", safe="")
     jobs, total = [], None
@@ -380,9 +402,12 @@ def oracle_list(host: str, site: str, site_number: str, search: str = "", pages:
             raise AdapterError("unexpected Oracle response shape (no items[0].requisitionList)")
         if total is None:
             total = item.get("TotalJobsCount")
-        jobs += [normalize_oracle(x, host, site, company) for x in batch]
+        fresh = [normalize_oracle(x, host, site, company) for x in batch]
+        jobs += fresh
         if len(batch) < page_size:
             break
+        if known and fresh and all(j["id"] in known for j in fresh):
+            break  # newest-first: a page of only known jobs means nothing newer is left
         time.sleep(0.5)
     return jobs, total
 
@@ -535,7 +560,7 @@ def diagnose_workday(host: str, site: str) -> None:
     for label, kw in tests:
         status, final, ctype, text = http_raw(url, method="POST", **kw)
         print(f"\n[{label}] HTTP {status}  type={ctype or '?'}")
-        print(f"   {re.sub(r'\s+', ' ', text)[:220]}")
+        print("   " + re.sub(r"\s+", " ", text)[:220])
     print("\n[browser-like session: cookies + CSRF token]")
     try:
         opener, token, notes = _wd_session(host, site)
@@ -548,7 +573,7 @@ def diagnose_workday(host: str, site: str) -> None:
         print(f"   POST with cookies + CSRF header failed: {e}")
     status, final, ctype, text = http_raw(f"https://{host}/{site}")
     print(f"\n[careers page] HTTP {status}  type={ctype or '?'}" + (f"  redirected to {final}" if final != f"https://{host}/{site}" else ""))
-    print(f"   {re.sub(r'\s+', ' ', text)[:220]}")
+    print("   " + re.sub(r"\s+", " ", text)[:220])
 
 
 def diagnose_eightfold(host: str, domain: str) -> None:
@@ -659,7 +684,8 @@ def greenhouse_detail(board: str, job_id: str) -> dict:
 # Multi-company layer used by the Discord bot
 # --------------------------------------------------------------------------- #
 COUNTRY_US = "United States of America"
-MAX_PAGES_PER_COMPANY = 8      # newest ~160 (Workday) / ~200 (Oracle) postings per company per poll
+SEED_PAGES = 3                 # first poll of a company: record its newest ~60 postings (Workday) quietly
+MAX_PAGES_PER_COMPANY = 8      # later polls read pages only until they reach postings already seen
 MAX_DETAIL_FETCHES = 30        # description fetches per poll (only for new, relevant, unclear jobs)
 INTERNISH = re.compile(r"intern|co-?op|student|apprentice", re.I)
 MULTI_LOC = re.compile(r"\b\d+\s+locations?\b", re.I)
@@ -713,16 +739,16 @@ def _watcher():
     return w
 
 
-def _fetch_workday(c: dict, max_pages: int) -> list[dict]:
+def _fetch_workday(c: dict, max_pages: int, known: set | None = None) -> list[dict]:
     host, site = c["host"], c["site"]
     fac = workday_facets(host, site)
     us = find_country_facet(fac)
     applied = {us[0]: [us[1]]} if us else {}
-    jobs, _ = workday_list(host, site, "", max_pages, company=c["name"], applied=applied)
+    jobs, _ = workday_list(host, site, "", max_pages, company=c["name"], applied=applied, known=known)
     intern_ids = [v["id"] for v in fac.get("workerSubType", []) if INTERNISH.search(v.get("descriptor") or "")]
     if intern_ids:  # some tenants (e.g. Alcon) have a real worker-type filter: use it for interns
         ij, _ = workday_list(host, site, "", max_pages, company=c["name"],
-                             applied={**applied, "workerSubType": intern_ids})
+                             applied={**applied, "workerSubType": intern_ids}, known=known)
         ids = {j["id"] for j in ij}
         for j in jobs:
             if j["id"] in ids:
@@ -734,16 +760,17 @@ def _fetch_workday(c: dict, max_pages: int) -> list[dict]:
     return jobs
 
 
-def _fetch_oracle(c: dict, max_pages: int) -> list[dict]:
-    jobs, _ = oracle_list(c["host"], c["site"], c["site_number"], "", max_pages, company=c["name"])
+def _fetch_oracle(c: dict, max_pages: int, known: set | None = None) -> list[dict]:
+    jobs, _ = oracle_list(c["host"], c["site"], c["site_number"], "", max_pages, company=c["name"], known=known)
     return [j for j in jobs if "united states" in j["location"].lower()]
 
 
-def _fetch_phenom(c: dict, max_pages: int) -> list[dict]:
+def _fetch_phenom(c: dict, max_pages: int, known: set | None = None) -> list[dict]:
     w = _watcher()
+    pages = min(max_pages, 2) if known else max_pages   # steady state: the newest ~100 per level is plenty
     out = []
     for site_level, level in (("Intern", "intern"), ("Entry Level", "early")):
-        res, _ = w.fetch_jobs("", False, max_pages, {"experienceLevel": [site_level], "country": [COUNTRY_US]})
+        res, _ = w.fetch_jobs("", False, pages, {"experienceLevel": [site_level], "country": [COUNTRY_US]})
         for j in res:
             if j["experience"] != site_level or COUNTRY_US not in j["country"]:
                 continue
@@ -755,7 +782,7 @@ def _fetch_phenom(c: dict, max_pages: int) -> list[dict]:
     return out
 
 
-def _fetch_greenhouse(c: dict, max_pages: int) -> list[dict]:
+def _fetch_greenhouse(c: dict, max_pages: int, known: set | None = None) -> list[dict]:
     jobs, _ = greenhouse_list(c["board"], "", 1, company=c["name"])
     us = [j for j in jobs if gh_is_us(c, j["location"])]
     for j in us:
@@ -763,7 +790,7 @@ def _fetch_greenhouse(c: dict, max_pages: int) -> list[dict]:
     return us
 
 
-def _fetch_eightfold(c: dict, max_pages: int) -> list[dict]:
+def _fetch_eightfold(c: dict, max_pages: int, known: set | None = None) -> list[dict]:
     jobs, _ = eightfold_list(c["host"], c["domain"], "", max_pages * 3, company=c["name"], max_jobs=200)
     us = [j for j in jobs if re.search(r"united states|\busa\b", j["location"], re.I)]
     for j in us:
@@ -771,14 +798,15 @@ def _fetch_eightfold(c: dict, max_pages: int) -> list[dict]:
     return us
 
 
-def fetch_company_jobs(c: dict, max_pages: int | None = None) -> list[dict]:
-    """US-only jobs for one company. Raises AdapterError on failure."""
-    mp = max_pages or MAX_PAGES_PER_COMPANY
+def fetch_company_jobs(c: dict, max_pages: int | None = None, known: set | None = None) -> list[dict]:
+    """US-only jobs for one company. `known` = job ids already seen: later polls stop paging as soon as a page
+    holds only known jobs, which keeps the request count small. Raises AdapterError on failure."""
+    mp = max_pages or (MAX_PAGES_PER_COMPANY if known else SEED_PAGES)
     fn = {"workday": _fetch_workday, "oracle": _fetch_oracle, "phenom": _fetch_phenom,
           "eightfold": _fetch_eightfold, "greenhouse": _fetch_greenhouse}.get(c["provider"])
     if not fn:
         raise AdapterError(f"unknown provider {c['provider']!r}")
-    jobs = fn(c, mp)
+    jobs = fn(c, mp, known)
     return [j for j in jobs if j["id"] and j["title"] and j["url"]]
 
 
