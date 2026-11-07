@@ -127,16 +127,16 @@ def probe_company(c: dict, samples: int = 4) -> bool:
         for k in ("workerSubType", "timeType"):
             if k in fac:
                 print(f"        {k}: " + ", ".join(f"{v['descriptor']} ({v['count']})" for v in fac[k][:8]))
-        us = find_country_id(fac)
+        us = find_country_facet(fac)
         applied = None
         if us:
             try:
                 _, t_all = workday_list(host, site, "", 1, company=c["name"])
-                _, t_us = workday_list(host, site, "", 1, company=c["name"], applied={"locationCountry": [us]})
+                _, t_us = workday_list(host, site, "", 1, company=c["name"], applied={us[0]: [us[1]]})
                 good = isinstance(t_us, int) and 0 < t_us <= (t_all or 10**9)
-                print(f"  {'PASS' if good else 'WARN'}  US country filter: total {t_all} -> {t_us}")
+                print(f"  {'PASS' if good else 'WARN'}  US country filter ({us[0]}): total {t_all} -> {t_us}")
                 if good:
-                    applied = {"locationCountry": [us]}
+                    applied = {us[0]: [us[1]]}
             except AdapterError as e:
                 print(f"  FAIL  US country filter - {e}")
                 ok = False
@@ -677,6 +677,186 @@ def selftest() -> bool:
     finally:
         A.http_json = saved
 
+    # --- round 5: Workday request-style fallback, richer HTTP errors, Workday diagnostics ---
+    import http.server, os, threading
+    os.environ["no_proxy"] = os.environ["NO_PROXY"] = "127.0.0.1"
+
+    class Err422(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            payload = b'{"errorCode":"HTTP_422","error":"simulated detail"}'
+            self.send_response(422)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), Err422)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        A.http_json("GET", f"http://127.0.0.1:{srv.server_port}/x")
+        expect("http 422 raises", False, True)
+    except A.AdapterError as e:
+        expect("http error message includes the server's reply", "HTTP 422" in str(e) and "simulated detail" in str(e), True)
+    finally:
+        srv.shutdown()
+
+    def wd_mock(reject):
+        def f(method, url, body=None, extra=None, timeout=30):
+            if reject(body or {}, extra):
+                raise A.AdapterError("HTTP 422 from x (simulated)")
+            if (body or {}).get("offset", 0) > 0:
+                return 200, {"total": 1, "jobPostings": [], "facets": []}
+            return 200, {"total": 1, "facets": [], "jobPostings": [
+                {"title": "Engineer", "externalPath": "/job/a/E_1", "bulletFields": ["R1"],
+                 "locationsText": "Austin, TX", "postedOn": "Posted Today"}]}
+        return f
+
+    saved_sleep = A.time.sleep
+    A.time.sleep = lambda s_: None
+    try:
+        for host, reject, want in [("v1.wd1.myworkdayjobs.com", lambda b, e: bool(e), 1),
+                                   ("v2.wd1.myworkdayjobs.com", lambda b, e: "appliedFacets" in b, 2),
+                                   ("v3.wd1.myworkdayjobs.com", lambda b, e: b.get("limit") != 10, 3)]:
+            A.http_json = wd_mock(reject)
+            got, _ = A.workday_list(host, "S", pages=1)
+            expect(f"workday fallback style {want} returns the job", len(got), 1)
+            expect(f"workday remembers style {want}", A._WD_VARIANT.get(host), want)
+
+        saved_sess, saved_spost = A._wd_session, A._wd_session_post
+        A._wd_session = lambda h, s_: (None, "", [])
+        def sess_422(opener, url, body, headers, timeout=30):
+            raise A.AdapterError("HTTP 422 from x (simulated)")
+        A._wd_session_post = sess_422
+        calls = []
+        def always_422(method, url, body=None, extra=None, timeout=30):
+            calls.append(1)
+            raise A.AdapterError("HTTP 422 from x (simulated)")
+        A.http_json = always_422
+        try:
+            A.workday_list("dead1.wd1.myworkdayjobs.com", "S")
+            expect("all styles failing raises", False, True)
+        except A.AdapterError as e:
+            expect("error says simplified styles failed too", "simplified" in str(e), True)
+        expect("all four plain styles were tried", len(calls), 4)
+
+        calls.clear()
+        def net_down(method, url, body=None, extra=None, timeout=30):
+            calls.append(1)
+            raise A.AdapterError("network error: unreachable")
+        A.http_json = net_down
+        try:
+            A.workday_list("dead2.wd1.myworkdayjobs.com", "S")
+        except A.AdapterError:
+            pass
+        expect("network errors fail fast (no style retries)", len(calls), 1)
+    finally:
+        A.http_json, A.time.sleep = saved, saved_sleep
+        A._wd_session, A._wd_session_post = saved_sess, saved_spost
+
+    saved_raw2 = A.http_raw
+    A.http_raw = lambda url, timeout=30, method="GET", body=None, headers=None: (
+        422, url, "application/json", '{"errorCode":"HTTP_422"}')
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            A.diagnose_workday("d.wd1.myworkdayjobs.com", "External")
+        out = buf.getvalue()
+        expect("workday diagnose runs every style", all(k in out for k in
+               ("standard request", "bare body", "smaller page", "careers page")), True)
+        expect("workday diagnose shows status and body", "HTTP 422" in out and "HTTP_422" in out, True)
+    finally:
+        A.http_raw = saved_raw2
+
+    # --- round 6: country facet under other names (e.g. GM's Location_Country) ---
+    gm_facets = [
+        {"facetParameter": "Location_Country", "descriptor": "Country", "values": [
+            {"descriptor": "United States of America", "id": "US9", "count": 5},
+            {"descriptor": "Mexico", "id": "MX9", "count": 2}]},
+        {"facetParameter": "workerSubType", "descriptor": "Worker Type", "values": [
+            {"descriptor": "Co-Op (Fixed Term)", "id": "CO1", "count": 2},
+            {"descriptor": "Regular", "id": "RG1", "count": 9}]}]
+    expect("country facet found under another name", A.find_country_facet(walk_facets(gm_facets)),
+           ("Location_Country", "US9"))
+    expect("no country facet -> None", A.find_country_facet(walk_facets(
+        [{"facetParameter": "timeType", "descriptor": "t", "values": [{"descriptor": "Full time", "id": "T", "count": 1}]}])), None)
+
+    seen_bodies = []
+    def fake_gm(method, url, body=None, extra=None, timeout=30):
+        seen_bodies.append(body)
+        applied = (body or {}).get("appliedFacets") or {}
+        def post(t, i):
+            return {"title": t, "externalPath": f"/job/a/J_{i}", "bulletFields": [f"R{i}"],
+                    "locationsText": "Austin, Texas, United States of America", "postedOn": "Posted Today"}
+        if (body or {}).get("offset", 0) > 0:
+            return 200, {"total": 2, "jobPostings": [], "facets": gm_facets}
+        posts = [post("Software Co-op", 1)] if "workerSubType" in applied else [post("Software Co-op", 1), post("Quality Engineer", 2)]
+        return 200, {"total": len(posts), "jobPostings": posts, "facets": gm_facets}
+
+    saved_sleep = A.time.sleep
+    A.http_json = fake_gm
+    A.time.sleep = lambda s_: None
+    try:
+        gm_jobs = A.fetch_company_jobs({"name": "GM", "provider": "workday", "host": "gm9.wd5.myworkdayjobs.com", "site": "S"})
+        applied_seen = [b.get("appliedFacets") for b in seen_bodies if b and b.get("appliedFacets")]
+        expect("country filter sent under the site's own facet name", {"Location_Country": ["US9"]} in applied_seen, True)
+        expect("intern filter combined with country filter",
+               {"Location_Country": ["US9"], "workerSubType": ["CO1"]} in applied_seen, True)
+        expect("co-op marked intern via worker type", {j["title"]: j["level"] for j in gm_jobs}["Software Co-op"], "intern")
+    finally:
+        A.http_json, A.time.sleep = saved, saved_sleep
+
+    # --- round 7: browser-like session (cookies + CSRF) style ---
+    saved_sess, saved_spost, saved_sget = A._wd_session, A._wd_session_post, A._wd_session_get
+    saved_sleep = A.time.sleep
+    A.time.sleep = lambda s_: None
+    sess_calls = {"post": 0, "get": 0}
+
+    def plain_422(method, url, body=None, extra=None, timeout=30):
+        raise A.AdapterError("HTTP 422 from x (simulated: plain requests rejected)")
+    A.http_json = plain_422
+    A._wd_session = lambda h, s_: ("opener", "tok123", ["GET /en-US/S: HTTP 200", "cookies: ['X']; CSRF token: yes"])
+
+    def sess_post(opener, url, body, headers, timeout=30):
+        sess_calls["post"] += 1
+        if headers.get("X-Calypso-CSRF-Token") != "tok123":
+            raise A.AdapterError("HTTP 422 (no csrf)")
+        if body.get("offset", 0) > 0:
+            return {"total": 1, "jobPostings": [], "facets": []}
+        return {"total": 1, "facets": [], "jobPostings": [
+            {"title": "Engineer", "externalPath": "/job/a/E_1", "bulletFields": ["R1"],
+             "locationsText": "Austin, TX", "postedOn": "Posted Today"}]}
+
+    def sess_get(opener, url, headers, timeout=30):
+        sess_calls["get"] += 1
+        return {"jobPostingInfo": {"jobDescription": "<p>2 years of experience.</p>",
+                                   "country": {"descriptor": "United States of America"}, "location": "Austin, TX"}}
+    A._wd_session_post, A._wd_session_get = sess_post, sess_get
+    try:
+        got, _ = A.workday_list("sess1.wd1.myworkdayjobs.com", "S", pages=1)
+        expect("session style returns jobs when plain styles are rejected", len(got), 1)
+        expect("session style remembered", A._WD_VARIANT.get("sess1.wd1.myworkdayjobs.com"), 4)
+        d = A.workday_detail("sess1.wd1.myworkdayjobs.com", "S", "/job/a/E_1")
+        expect("detail uses the session too", (sess_calls["get"], "2 years" in d["description_html"]), (1, True))
+        with contextlib.redirect_stdout(io.StringIO()):
+            ok_s = test_company({"name": "S", "provider": "workday", "host": "sess1.wd1.myworkdayjobs.com", "site": "S"})
+        expect("test runner works through the session style", ok_s, True)
+        # diagnose prints the session section
+        saved_raw3 = A.http_raw
+        A.http_raw = lambda url, timeout=30, method="GET", body=None, headers=None: (422, url, "application/json", "{}")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            A.diagnose_workday("sess1.wd1.myworkdayjobs.com", "S")
+        A.http_raw = saved_raw3
+        out = buf.getvalue()
+        expect("diagnose shows session test", "browser-like session" in out and "POST with cookies + CSRF header: OK" in out, True)
+        expect("diagnose shows Windows UA test", "Windows Chrome user-agent" in out, True)
+    finally:
+        A.http_json, A.time.sleep = saved, saved_sleep
+        A._wd_session, A._wd_session_post, A._wd_session_get = saved_sess, saved_spost, saved_sget
+
     if failures:
         print("SELFTEST FAILED:\n  " + "\n  ".join(failures))
         return False
@@ -696,7 +876,7 @@ def main() -> None:
     ap.add_argument("--domain", help="Eightfold domain param (default: <tenant>.com)")
     ap.add_argument("--greenhouse-board", help="test a Greenhouse board: its name (e.g. spacex) or any job-board URL")
     ap.add_argument("--pages", type=int, default=2)
-    ap.add_argument("--diagnose", action="store_true", help="Eightfold only: show raw server responses")
+    ap.add_argument("--diagnose", action="store_true", help="Workday / Eightfold: show raw server responses")
     ap.add_argument("--probe", action="store_true", help="step 2: facets, US filter, description-based level")
     args = ap.parse_args()
 
@@ -738,8 +918,10 @@ def main() -> None:
         for c in targets:
             if c["provider"] == "eightfold":
                 diagnose_eightfold(c["host"], c["domain"])
+            elif c["provider"] == "workday":
+                diagnose_workday(c["host"], c["site"])
             else:
-                print(f"--diagnose only supports Eightfold; use --probe for {c['name']}")
+                print(f"--diagnose supports Workday and Eightfold; use --probe for {c['name']}")
         sys.exit(0)
     oks = [(probe_company(c) if args.probe else test_company(c, args.pages)) for c in targets]
     print(f"\n{sum(oks)}/{len(oks)} companies OK")

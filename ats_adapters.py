@@ -15,6 +15,7 @@ min_years / entry_words (filled in by enrich_jobs from the job description).
 import argparse
 import datetime as dt
 import html
+import http.cookiejar
 import json
 import re
 import sys
@@ -80,7 +81,11 @@ def http_json(method: str, url: str, body=None, extra=None, timeout: int = 30):
             return r.status, json.loads(r.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
         hint = " (possibly bot protection - try later or from another network)" if e.code in (403, 429) else ""
-        raise AdapterError(f"HTTP {e.code} from {url.split('?')[0]}{hint}")
+        try:
+            detail = e.read(300).decode("utf-8", "replace").strip().replace("\n", " ")
+        except Exception:
+            detail = ""
+        raise AdapterError(f"HTTP {e.code} from {url.split('?')[0]}{hint}" + (f": {detail}" if detail else ""))
     except urllib.error.URLError as e:
         raise AdapterError(f"network error: {e.reason}")
     except json.JSONDecodeError:
@@ -125,26 +130,129 @@ def normalize_workday(p: dict, host: str, site: str, company: str = "") -> dict:
     })
 
 
+_WD_VARIANT: dict[str, int] = {}   # host -> request style that worked
+_WD_SESSIONS: dict[str, tuple] = {}   # host -> (opener with cookies, csrf token, notes)
+
+
+def _open_json(opener, req, timeout: int, url: str):
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read(300).decode("utf-8", "replace").strip().replace("\n", " ")
+        except Exception:
+            detail = ""
+        raise AdapterError(f"HTTP {e.code} from {url.split('?')[0]}" + (f": {detail}" if detail else ""))
+    except urllib.error.URLError as e:
+        raise AdapterError(f"network error: {e.reason}")
+    except json.JSONDecodeError:
+        raise AdapterError("response was not JSON (probably an HTML page or bot check)")
+
+
+def _wd_session(host: str, site: str):
+    """Behave like a browser: load the public careers page once, keep its cookies, and pick up the CSRF
+    token Workday sets. Returns (opener, csrf_token, notes)."""
+    if host in _WD_SESSIONS:
+        return _WD_SESSIONS[host]
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    opener.addheaders = [("User-Agent", UA), ("Accept-Language", "en-US,en;q=0.9"),
+                         ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")]
+    notes = []
+    for path in (f"/en-US/{site}", f"/{site}"):
+        try:
+            with opener.open(f"https://{host}{path}", timeout=30) as r:
+                r.read(2000)
+                notes.append(f"GET {path}: HTTP {r.status}")
+        except urllib.error.HTTPError as e:
+            notes.append(f"GET {path}: HTTP {e.code}")
+        except Exception as e:
+            notes.append(f"GET {path}: {type(e).__name__}")
+    token = next((c.value for c in jar if c.name.upper() == "CALYPSO_CSRF_TOKEN"), "")
+    notes.append(f"cookies: {sorted({c.name for c in jar})}; CSRF token: {'yes' if token else 'no'}")
+    _WD_SESSIONS[host] = (opener, token, notes)
+    return _WD_SESSIONS[host]
+
+
+def _wd_session_headers(host: str, site: str, token: str) -> dict:
+    h = {"Content-Type": "application/json", "Accept": "application/json", "Accept-Language": "en-US,en;q=0.9",
+         "Origin": f"https://{host}", "Referer": f"https://{host}/en-US/{site}"}
+    if token:
+        h["X-Calypso-CSRF-Token"] = token
+    return h
+
+
+def _wd_session_post(opener, url: str, body: dict, headers: dict, timeout: int = 30):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers, method="POST")
+    return _open_json(opener, req, timeout, url)
+
+
+def _wd_session_get(opener, url: str, headers: dict, timeout: int = 30):
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    return _open_json(opener, req, timeout, url)
+
+
+def _wd_request(host: str, site: str, offset: int, page_size: int, search: str, applied, variant: int):
+    """POST to Workday's job-search endpoint. Styles: 0 = standard, 1 = no Origin/Referer headers,
+    2 = bare body (limit/offset only), 3 = smaller pages (10), 4 = browser-like session (cookies + CSRF).
+    Some tenants reject the standard request."""
+    tenant = host.split(".")[0]
+    if variant == 4:  # browser-like session: cookies + CSRF token
+        opener, token, _ = _wd_session(host, site)
+        body = {"appliedFacets": applied or {}, "limit": page_size, "offset": offset, "searchText": search}
+        data = _wd_session_post(opener, f"https://{host}/wday/cxs/{tenant}/{site}/jobs", body,
+                                _wd_session_headers(host, site, token))
+        return data, page_size
+    size = 10 if variant == 3 else page_size
+    body = {"limit": size, "offset": offset}
+    if variant == 2:
+        if applied:
+            body["appliedFacets"] = applied
+        if search:
+            body["searchText"] = search
+    else:
+        body["appliedFacets"] = applied or {}
+        body["searchText"] = search
+    extra = {"Origin": f"https://{host}", "Referer": f"https://{host}/{site}"} if variant == 0 else None
+    _, data = http_json("POST", f"https://{host}/wday/cxs/{tenant}/{site}/jobs", body, extra=extra)
+    return data, size
+
+
+def _wd_post(host: str, site: str, offset: int, page_size: int, search: str, applied):
+    """Try the request styles in order (only after an HTTP 4xx); remember the one that works per host."""
+    order = [_WD_VARIANT[host]] if host in _WD_VARIANT else [0, 1, 2, 3, 4]
+    first_err = None
+    for v in order:
+        try:
+            data, size = _wd_request(host, site, offset, page_size, search, applied, v)
+        except AdapterError as e:
+            if not str(e).startswith("HTTP 4"):
+                raise
+            first_err = first_err or e
+            continue
+        _WD_VARIANT[host] = v
+        return data, size
+    raise AdapterError(f"{first_err}" + (" [simplified request styles failed too]" if len(order) > 1 else ""))
+
+
 def workday_list(host: str, site: str, search: str = "", pages: int = 2,
                  page_size: int = 20, company: str = "", applied: dict | None = None):
-    tenant = host.split(".")[0]
-    url = f"https://{host}/wday/cxs/{tenant}/{site}/jobs"
-    jobs, total = [], None
-    for p in range(pages):
-        _, data = http_json(
-            "POST", url,
-            {"appliedFacets": applied or {}, "limit": page_size, "offset": p * page_size, "searchText": search},
-            extra={"Origin": f"https://{host}", "Referer": f"https://{host}/{site}"})
+    jobs, total, offset = [], None, 0
+    for _ in range(pages):
+        data, size = _wd_post(host, site, offset, page_size, search, applied)
         if not isinstance(data, dict) or "jobPostings" not in data:
             raise AdapterError("unexpected Workday response shape (no 'jobPostings')")
         if total is None:
             total = data.get("total")
         batch = data["jobPostings"]
         jobs += [normalize_workday(x, host, site, company) for x in batch]
-        if len(batch) < page_size:
+        offset += len(batch)
+        if len(batch) < size:
             break
         time.sleep(0.5)
     return jobs, total
+
 
 # --------------------------------------------------------------------------- #
 # Workday extras: facets (server-side filters), job detail, experience parsing
@@ -163,18 +271,24 @@ def walk_facets(facets, out: dict | None = None) -> dict:
     return out
 
 
-def find_country_id(fac: dict, name: str = "United States") -> str | None:
-    for v in fac.get("locationCountry", []):
-        if name.lower() in (v.get("descriptor") or "").lower():
-            return v["id"]
+def find_country_facet(fac: dict, name: str = "United States") -> tuple[str, str] | None:
+    """(facet_name, value_id) for the US in whichever facet mentions 'country'
+    (sites call it locationCountry, Location_Country, country, ...)."""
+    for param, vals in fac.items():
+        if "country" in param.lower():
+            for v in vals:
+                if name.lower() in (v.get("descriptor") or "").lower():
+                    return param, v["id"]
     return None
 
 
+def find_country_id(fac: dict, name: str = "United States") -> str | None:
+    found = find_country_facet(fac, name)
+    return found[1] if found else None
+
+
 def workday_facets(host: str, site: str) -> dict:
-    tenant = host.split(".")[0]
-    _, data = http_json("POST", f"https://{host}/wday/cxs/{tenant}/{site}/jobs",
-                        {"appliedFacets": {}, "limit": 1, "offset": 0, "searchText": ""},
-                        extra={"Origin": f"https://{host}", "Referer": f"https://{host}/{site}"})
+    data, _ = _wd_post(host, site, 0, 1, "", None)
     if not isinstance(data, dict) or "facets" not in data:
         raise AdapterError("no 'facets' in Workday response")
     return walk_facets(data["facets"])
@@ -182,8 +296,13 @@ def workday_facets(host: str, site: str) -> dict:
 
 def workday_detail(host: str, site: str, external_path: str) -> dict:
     tenant = host.split(".")[0]
-    _, data = http_json("GET", f"https://{host}/wday/cxs/{tenant}/{site}{external_path}",
-                        extra={"Referer": f"https://{host}/{site}"})
+    url = f"https://{host}/wday/cxs/{tenant}/{site}{external_path}"
+    if _WD_VARIANT.get(host) == 4:
+        opener, token, _ = _wd_session(host, site)
+        headers = {k: v for k, v in _wd_session_headers(host, site, token).items() if k != "Content-Type"}
+        data = _wd_session_get(opener, url, headers)
+    else:
+        _, data = http_json("GET", url, extra={"Referer": f"https://{host}/{site}"})
     info = (data or {}).get("jobPostingInfo")
     if not isinstance(info, dict):
         raise AdapterError("no 'jobPostingInfo' in detail response")
@@ -382,9 +501,14 @@ def eightfold_detail(host: str, domain: str, ext_id: str) -> dict:
     raise AdapterError("Eightfold detail failed (" + "; ".join(errors) + ")")
 
 
-def http_raw(url: str, timeout: int = 30):
+def http_raw(url: str, timeout: int = 30, method: str = "GET", body=None, headers=None):
     """Diagnostics only: (status, final_url, content_type, first bytes of body), never raises on HTTP errors."""
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json, text/html"})
+    hdrs = {"User-Agent": UA, "Accept": "application/json, text/html"}
+    if body is not None:
+        hdrs["Content-Type"] = "application/json"
+    hdrs.update(headers or {})
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, r.geturl(), r.headers.get("Content-Type", ""), r.read(2000).decode("utf-8", "replace")
@@ -392,6 +516,39 @@ def http_raw(url: str, timeout: int = 30):
         return e.code, url, (e.headers.get("Content-Type", "") if e.headers else ""), e.read(500).decode("utf-8", "replace")
     except urllib.error.URLError as e:
         return 0, url, "", f"network error: {e.reason}"
+
+
+def diagnose_workday(host: str, site: str) -> None:
+    tenant = host.split(".")[0]
+    url = f"https://{host}/wday/cxs/{tenant}/{site}/jobs"
+    origin = {"Origin": f"https://{host}", "Referer": f"https://{host}/{site}"}
+    full = {"appliedFacets": {}, "limit": 20, "offset": 0, "searchText": ""}
+    tests = [
+        ("standard request", dict(body=full, headers=origin)),
+        ("without Origin/Referer", dict(body=full)),
+        ("bare body (limit/offset only)", dict(body={"limit": 20, "offset": 0})),
+        ("smaller page (limit 10)", dict(body={**full, "limit": 10})),
+        ("Windows Chrome user-agent", dict(body=full, headers={**origin, "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"})),
+    ]
+    print(f"Diagnosing Workday site {host} / {site}")
+    for label, kw in tests:
+        status, final, ctype, text = http_raw(url, method="POST", **kw)
+        print(f"\n[{label}] HTTP {status}  type={ctype or '?'}")
+        print(f"   {re.sub(r'\s+', ' ', text)[:220]}")
+    print("\n[browser-like session: cookies + CSRF token]")
+    try:
+        opener, token, notes = _wd_session(host, site)
+        for n in notes:
+            print(f"   {n}")
+        data = _wd_session_post(opener, url, full, _wd_session_headers(host, site, token))
+        print(f"   POST with cookies + CSRF header: OK, {len(data.get('jobPostings', [])) if isinstance(data, dict) else '?'} "
+              f"postings, total={data.get('total') if isinstance(data, dict) else '?'}")
+    except AdapterError as e:
+        print(f"   POST with cookies + CSRF header failed: {e}")
+    status, final, ctype, text = http_raw(f"https://{host}/{site}")
+    print(f"\n[careers page] HTTP {status}  type={ctype or '?'}" + (f"  redirected to {final}" if final != f"https://{host}/{site}" else ""))
+    print(f"   {re.sub(r'\s+', ' ', text)[:220]}")
 
 
 def diagnose_eightfold(host: str, domain: str) -> None:
@@ -518,8 +675,10 @@ COMPANIES = [
      "host": "edbz.fa.us2.oraclecloud.com", "site": "CX", "site_number": "CX_1"},
     {"name": "Boeing", "provider": "workday",
      "host": "boeing.wd1.myworkdayjobs.com", "site": "EXTERNAL_CAREERS"},
-    {"name": "Dell Technologies", "provider": "workday",
-     "host": "dell.wd1.myworkdayjobs.com", "site": "External"},
+    # Parked: Dell's Workday site rejects every automated request style we tried (HTTP 422, empty message).
+    # To retry later, uncomment and run `py test_adapters.py --company dell --diagnose`.
+    # {"name": "Dell Technologies", "provider": "workday",
+    #  "host": "dell.wd1.myworkdayjobs.com", "site": "External"},
     {"name": "General Motors", "provider": "workday",
      "host": "generalmotors.wd5.myworkdayjobs.com", "site": "Careers_GM"},
     {"name": "NXP Semiconductors", "provider": "workday",
@@ -557,8 +716,8 @@ def _watcher():
 def _fetch_workday(c: dict, max_pages: int) -> list[dict]:
     host, site = c["host"], c["site"]
     fac = workday_facets(host, site)
-    us = find_country_id(fac)
-    applied = {"locationCountry": [us]} if us else {}
+    us = find_country_facet(fac)
+    applied = {us[0]: [us[1]]} if us else {}
     jobs, _ = workday_list(host, site, "", max_pages, company=c["name"], applied=applied)
     intern_ids = [v["id"] for v in fac.get("workerSubType", []) if INTERNISH.search(v.get("descriptor") or "")]
     if intern_ids:  # some tenants (e.g. Alcon) have a real worker-type filter: use it for interns
